@@ -1,0 +1,6 @@
+{
+  "name": "LiveNex TV",
+  "description": "Watch LiveNex TV (livenextv.xyz) in a dark cinema Android app with fullscreen landscape video, orientation control, pull-to-refresh, and offline recovery.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

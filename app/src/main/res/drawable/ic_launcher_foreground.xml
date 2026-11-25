@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Subtle crimson cinema emblem backing pill inside 66dp safe zone -->
+    <path
+        android:fillColor="#E50914"
+        android:pathData="M34,30 L74,30 C78.4,30 82,33.6 82,38 L82,66 C82,70.4 78.4,74 74,74 L34,74 C29.6,74 26,70.4 26,66 L26,38 C26,33.6 29.6,30 34,30 Z" />
+    <!-- Crisp white play triangle centered inside screen -->
+    <path
+        android:fillColor="#F5F7FA"
+        android:pathData="M47,42 L47,62 L65,52 Z" />
+    <!-- Minimalist cinema TV stand bar -->
+    <path
+        android:fillColor="#F5F7FA"
+        android:pathData="M42,78 L66,78 C67.1,78 68,78.9 68,80 C68,81.1 67.1,82 66,82 L42,82 C40.9,82 40,81.1 40,80 C40,78.9 40.9,78 42,78 Z" />
+    <!-- Live broadcast status dot -->
+    <path
+        android:fillColor="#FF4D58"
+        android:pathData="M74,36 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0" />
+</vector>

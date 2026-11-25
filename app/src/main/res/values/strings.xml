@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LiveNex TV</string>
+    <string name="brand_live_badge">LIVE</string>
+    <string name="loading_stream">Connecting to LiveNex TV…</string>
+
+    <!-- Accessibility content descriptions -->
+    <string name="cd_brand_logo">LiveNex TV logo</string>
+    <string name="cd_enter_pip">Enter Picture-in-Picture mode</string>
+    <string name="cd_offline_illustration">No internet connection icon</string>
+
+    <!-- Hints & notifications -->
+    <string name="press_back_again_to_exit">Press back again to exit LiveNex TV</string>
+    <string name="pull_to_refresh_hint">Pull to refresh</string>
+    <string name="release_to_refresh_hint">Release to reload</string>
+    <string name="refreshing_stream">Refreshing…</string>
+
+    <!-- Offline & error recovery screen -->
+    <string name="offline_status_badge">OFFLINE</string>
+    <string name="online_status_badge">BACK ONLINE</string>
+    <string name="error_offline_title">You\'re Offline</string>
+    <string name="error_offline_message">Check your Wi‑Fi or mobile data connection to resume watching LiveNex TV.</string>
+    <string name="error_load_failed_title">Stream Unavailable</string>
+    <string name="error_load_failed_message">We couldn\'t reach LiveNex TV right now. Please try reloading in a moment.</string>
+    <string name="action_retry_stream">Retry Stream</string>
+    <string name="action_open_home">Open Home</string>
+    <string name="connection_restored_message">Connection restored. Tap Retry Stream to continue watching.</string>
+    <string name="external_link_blocked">Blocked unsupported link</string>
+    <string name="external_app_unavailable">No app installed to open this link</string>
+</resources>
