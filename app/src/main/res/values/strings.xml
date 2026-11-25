@@ -9,11 +9,6 @@
     <string name="cd_enter_pip">Enter Picture-in-Picture mode</string>
     <string name="cd_offline_illustration">No internet connection icon</string>
 
-    <!-- Picture-in-Picture controls & status -->
-    <string name="pip_action_play">Play</string>
-    <string name="pip_action_pause">Pause</string>
-    <string name="pip_unavailable_message">Enable Picture-in-Picture for LiveNex TV in Android Settings.</string>
-
     <!-- Hints & notifications -->
     <string name="press_back_again_to_exit">Press back again to exit LiveNex TV</string>
     <string name="pull_to_refresh_hint">Pull to refresh</string>

@@ -14,8 +14,8 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 
 /**
- * Handles navigation safely inside [LiveNexWebView], blocking unsupported/unsafe URI schemes
- * and surfacing main-frame connection errors to the Compose recovery UI.
+ * Handles navigation safely inside [LiveNexWebView], blocking unsupported/unsafe URI schemes,
+ * installing the player PiP polyfill on web pages, and surfacing main-frame connection errors.
  */
 class LiveNexWebViewClient(
     private val context: Context,
@@ -37,7 +37,6 @@ class LiveNexWebViewClient(
         val scheme = uri.scheme?.lowercase().orEmpty()
         return when (scheme) {
             "https", "http" -> {
-                // Allow standard web navigation inside WebView
                 false
             }
             "mailto", "tel" -> {
@@ -52,7 +51,6 @@ class LiveNexWebViewClient(
                 true
             }
             else -> {
-                // Block file://, content://, javascript:, intent:, and other non-web schemes
                 onBlockedLinkCallback()
                 true
             }
@@ -65,9 +63,19 @@ class LiveNexWebViewClient(
         onPageStartedCallback(url.orEmpty(), view?.canGoBack() == true)
     }
 
+    override fun onPageCommitVisible(view: WebView?, url: String?) {
+        super.onPageCommitVisible(view, url)
+        if (url != null && (url.startsWith("https://") || url.startsWith("http://"))) {
+            (view as? LiveNexWebView)?.installWebPipPolyfill()
+        }
+    }
+
     override fun onPageFinished(view: WebView?, url: String?) {
         super.onPageFinished(view, url)
         if (!mainFrameErrorOccurred) {
+            if (url != null && (url.startsWith("https://") || url.startsWith("http://"))) {
+                (view as? LiveNexWebView)?.installWebPipPolyfill()
+            }
             onPageFinishedCallback(
                 url.orEmpty(),
                 view?.title,
@@ -84,7 +92,6 @@ class LiveNexWebViewClient(
         super.onReceivedError(view, request, error)
         if (request?.isForMainFrame == true) {
             val code = error?.errorCode ?: ERROR_UNKNOWN
-            // Ignore navigation cancellations triggered by quick redirects or manual reloads
             if (code == ERROR_CONNECT || code == ERROR_HOST_LOOKUP || code == ERROR_TIMEOUT ||
                 code == ERROR_IO || code == ERROR_FAILED_SSL_HANDSHAKE || code == ERROR_UNKNOWN
             ) {

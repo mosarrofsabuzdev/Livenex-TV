@@ -21,6 +21,7 @@ data class LiveNexUiState(
     val isOnline: Boolean = true,
     val isFullscreenVideo: Boolean = false,
     val isInPipMode: Boolean = false,
+    val isPreparingPip: Boolean = false,
     val isPipSupported: Boolean = false,
     val error: WebErrorInfo? = null,
 )

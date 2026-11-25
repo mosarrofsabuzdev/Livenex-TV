@@ -1,20 +1,14 @@
 package com.example
 
-import android.app.PendingIntent
 import android.app.PictureInPictureParams
-import android.app.RemoteAction
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
-import android.graphics.Rect
-import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Rational
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -25,7 +19,6 @@ import androidx.activity.viewModels
 import androidx.annotation.RequiresApi
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -45,29 +38,19 @@ class MainActivity : ComponentActivity() {
     private val viewModel: LiveNexViewModel by viewModels()
     private lateinit var networkMonitor: NetworkMonitor
     private var activeWebView: LiveNexWebView? = null
-    private var pipSourceRect: Rect? = null
-    private var isPipPlaying: Boolean = true
-    private var isReceiverRegistered: Boolean = false
+    private var exitFullscreenAction: (() -> Unit)? = null
 
-    private val pipMediaAction: String
-        get() = "$packageName.ACTION_PIP_TOGGLE_PLAYBACK"
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var pendingPipFallbackRunnable: Runnable? = null
+
+    // Tracks whether we promoted an inline <video> into temporary native fullscreen solely for PiP
+    private var pendingPipOnFullscreen: Boolean = false
+    private var enteredFullscreenForPip: Boolean = false
+    private var pendingPipAspectRatio: Rational = Rational(16, 9)
 
     private val isPipSupported: Boolean
         get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
-
-    private val pipControlReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != pipMediaAction) return
-            activeWebView?.togglePipPlayback { nowPlaying ->
-                isPipPlaying = nowPlaying
-                val state = viewModel.uiState.value
-                updatePipParams(
-                    autoEnterEnabled = state.isInitialLoadComplete && state.error == null,
-                )
-            }
-        }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,11 +61,10 @@ class MainActivity : ComponentActivity() {
         )
 
         viewModel.setPipSupported(isPipSupported)
+        disableAutoEnterPip()
 
         networkMonitor = NetworkMonitor(applicationContext)
         networkMonitor.start()
-
-        registerPipControlReceiver()
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -95,20 +77,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             val uiState by viewModel.uiState.collectAsStateWithLifecycle()
 
-            LaunchedEffect(uiState.isFullscreenVideo, uiState.isInPipMode) {
+            LaunchedEffect(uiState.isFullscreenVideo, uiState.isInPipMode, uiState.isPreparingPip) {
                 applyWindowAndOrientation(
                     isFullscreenVideo = uiState.isFullscreenVideo,
                     isInPipMode = uiState.isInPipMode,
-                )
-            }
-
-            LaunchedEffect(
-                uiState.isInitialLoadComplete,
-                uiState.error,
-                uiState.isFullscreenVideo,
-            ) {
-                updatePipParams(
-                    autoEnterEnabled = uiState.isInitialLoadComplete && uiState.error == null,
+                    isPreparingPip = uiState.isPreparingPip,
                 )
             }
 
@@ -118,119 +91,165 @@ class MainActivity : ComponentActivity() {
                     onRegisterWebView = { webView ->
                         activeWebView = webView
                     },
-                    onPipSourceRectChanged = { rect ->
-                        pipSourceRect = rect
-                        val state = viewModel.uiState.value
-                        updatePipParams(
-                            autoEnterEnabled = state.isInitialLoadComplete && state.error == null,
-                        )
+                    onRegisterExitFullscreen = { action ->
+                        exitFullscreenAction = action
                     },
-                    onEnterPipMode = { enterLiveNexPipMode() },
+                    onFullscreenVideoMounted = {
+                        handleFullscreenVideoMounted()
+                    },
+                    onWebPlayerPipRequested = { width, height, awaitFullscreen ->
+                        handleWebPlayerPipRequest(width, height, awaitFullscreen)
+                    },
+                    onFullscreenPipButtonClick = {
+                        handleFullscreenButtonPipRequest()
+                    },
                     onExitApp = { finish() },
                 )
             }
         }
     }
 
-    private fun registerPipControlReceiver() {
-        if (isReceiverRegistered || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val filter = IntentFilter(pipMediaAction)
-        ContextCompat.registerReceiver(
-            this,
-            pipControlReceiver,
-            filter,
-            ContextCompat.RECEIVER_NOT_EXPORTED,
-        )
-        isReceiverRegistered = true
+    /**
+     * Triggered when the user taps the website video player's own PiP icon.
+     * Waits briefly for native HTML5 video fullscreen (`onShowCustomView`) to mount the pure
+     * video surface; if not mounted in time, enters PiP directly with the strictly isolated <video>.
+     */
+    private fun handleWebPlayerPipRequest(
+        videoWidth: Int,
+        videoHeight: Int,
+        awaitFullscreenView: Boolean,
+    ) {
+        if (!isPipSupported || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        if (isInPictureInPictureMode) return
+
+        cancelPendingPipFallback()
+        pendingPipAspectRatio = safePipRational(videoWidth, videoHeight)
+        viewModel.setPreparingPip(true)
+
+        if (awaitFullscreenView && !viewModel.uiState.value.isFullscreenVideo) {
+            pendingPipOnFullscreen = true
+            val fallback = Runnable {
+                if (pendingPipOnFullscreen) {
+                    pendingPipOnFullscreen = false
+                    enteredFullscreenForPip = false
+                    enterLiveNexPipNow(pendingPipAspectRatio)
+                }
+            }
+            pendingPipFallbackRunnable = fallback
+            mainHandler.postDelayed(fallback, 240L)
+        } else {
+            pendingPipOnFullscreen = false
+            enteredFullscreenForPip = false
+            // Allow one compositor frame so isolated <video> is painted before entering PiP
+            mainHandler.postDelayed({
+                enterLiveNexPipNow(pendingPipAspectRatio)
+            }, 64L)
+        }
+    }
+
+    /**
+     * Called immediately when `WebChromeClient.onShowCustomView` mounts the pure video surface.
+     */
+    private fun handleFullscreenVideoMounted() {
+        if (!pendingPipOnFullscreen) return
+        cancelPendingPipFallback()
+        pendingPipOnFullscreen = false
+        enteredFullscreenForPip = true
+        // Wait one frame for the fullscreen video SurfaceView to attach before shrinking into PiP
+        mainHandler.postDelayed({
+            enterLiveNexPipNow(pendingPipAspectRatio)
+        }, 48L)
+    }
+
+    /**
+     * Triggered when the user taps the PiP icon while already in fullscreen video mode.
+     * Isolates only the <video> inside any fullscreen wrapper div before entering PiP.
+     */
+    private fun handleFullscreenButtonPipRequest() {
+        if (!isPipSupported || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        if (isInPictureInPictureMode) return
+
+        cancelPendingPipFallback()
+        pendingPipOnFullscreen = false
+        enteredFullscreenForPip = false
+        viewModel.setPreparingPip(true)
+
+        val wv = activeWebView
+        if (wv != null) {
+            wv.isolateVideoForPipAndRun { width, height ->
+                enterLiveNexPipNow(safePipRational(width, height))
+            }
+        } else {
+            enterLiveNexPipNow(Rational(16, 9))
+        }
+    }
+
+    private fun cancelPendingPipFallback() {
+        pendingPipFallbackRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingPipFallbackRunnable = null
+    }
+
+    private fun safePipRational(width: Int, height: Int): Rational {
+        if (width <= 0 || height <= 0) return Rational(16, 9)
+        val ratio = width.toFloat() / height.toFloat()
+        // Android requires PiP aspect ratio within [0.418410, 2.390000]
+        return when {
+            ratio < 0.45f -> Rational(9, 20)
+            ratio > 2.35f -> Rational(235, 100)
+            else -> Rational(width, height)
+        }
     }
 
     @RequiresApi(Build.VERSION_CODES.O)
-    private fun buildPipParams(autoEnterEnabled: Boolean): PictureInPictureParams {
+    private fun buildPipParams(aspectRatio: Rational = Rational(16, 9)): PictureInPictureParams {
         val builder = PictureInPictureParams.Builder()
-            .setAspectRatio(Rational(16, 9))
-            .setActions(listOf(buildPlayPauseAction()))
-
-        pipSourceRect?.takeIf { !it.isEmpty }?.let { rect ->
-            builder.setSourceRectHint(rect)
-        }
+            .setAspectRatio(aspectRatio)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Never auto-enter PiP on minimize/Home — PiP activates ONLY via explicit PiP icon tap
             builder
-                .setAutoEnterEnabled(autoEnterEnabled)
+                .setAutoEnterEnabled(false)
                 .setSeamlessResizeEnabled(true)
         }
         return builder.build()
     }
 
-    @RequiresApi(Build.VERSION_CODES.O)
-    private fun buildPlayPauseAction(): RemoteAction {
-        val intent = Intent(pipMediaAction).setPackage(packageName)
-        val pendingIntent = PendingIntent.getBroadcast(
-            this,
-            PIP_PLAYBACK_REQUEST_CODE,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val iconRes = if (isPipPlaying) {
-            android.R.drawable.ic_media_pause
-        } else {
-            android.R.drawable.ic_media_play
-        }
-        val title = getString(
-            if (isPipPlaying) R.string.pip_action_pause else R.string.pip_action_play,
-        )
-        return RemoteAction(
-            Icon.createWithResource(this, iconRes),
-            title,
-            title,
-            pendingIntent,
-        )
-    }
-
-    private fun updatePipParams(autoEnterEnabled: Boolean) {
-        if (!isPipSupported || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+    private fun disableAutoEnterPip() {
+        if (!isPipSupported || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
         try {
-            setPictureInPictureParams(buildPipParams(autoEnterEnabled))
+            setPictureInPictureParams(buildPipParams())
         } catch (_: IllegalStateException) {
-            // Ignore if activity is finishing or not yet attached to window.
+            // Ignore if window is not yet attached.
         }
     }
 
-    private fun enterLiveNexPipMode(): Boolean {
-        if (!isPipSupported || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
-        if (isInPictureInPictureMode) return true
-        val state = viewModel.uiState.value
-        val allowAutoEnter = state.isInitialLoadComplete && state.error == null
-        isPipPlaying = true
-
-        // Focus inline/iframe player cleanly before morphing into PiP when not in HTML5 fullscreen
-        if (!state.isFullscreenVideo) {
-            activeWebView?.enterPipVideoFocus()
+    private fun enterLiveNexPipNow(aspectRatio: Rational) {
+        if (!isPipSupported || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            viewModel.setPreparingPip(false)
+            return
         }
-
-        return try {
-            val entered = enterPictureInPictureMode(buildPipParams(autoEnterEnabled = allowAutoEnter))
-            if (!entered && !state.isFullscreenVideo) {
-                activeWebView?.exitPipVideoFocus()
+        if (isInPictureInPictureMode) {
+            viewModel.setPreparingPip(false)
+            return
+        }
+        try {
+            val entered = enterPictureInPictureMode(buildPipParams(aspectRatio))
+            if (!entered) {
+                recoverFailedPipEntry()
             }
-            entered
         } catch (_: IllegalStateException) {
-            if (!state.isFullscreenVideo) {
-                activeWebView?.exitPipVideoFocus()
-            }
-            false
+            recoverFailedPipEntry()
         }
     }
 
-    override fun onUserLeaveHint() {
-        super.onUserLeaveHint()
-        // Trigger PiP on Home/Recents across Android 8–16 (essential on MIUI/HyperOS & 3-button nav)
-        if (isPipSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val state = viewModel.uiState.value
-            if (state.isInitialLoadComplete && state.error == null && !isInPictureInPictureMode) {
-                enterLiveNexPipMode()
-            }
+    private fun recoverFailedPipEntry() {
+        viewModel.setPreparingPip(false)
+        val shouldExitTempFs = enteredFullscreenForPip
+        enteredFullscreenForPip = false
+        if (shouldExitTempFs) {
+            exitFullscreenAction?.invoke()
         }
+        activeWebView?.restorePageAfterPip(exitTemporaryFullscreen = shouldExitTempFs)
     }
 
     override fun onPictureInPictureModeChanged(
@@ -238,23 +257,28 @@ class MainActivity : ComponentActivity() {
         newConfig: Configuration,
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        cancelPendingPipFallback()
+        pendingPipOnFullscreen = false
         viewModel.onPipModeChanged(isInPictureInPictureMode)
 
         if (isInPictureInPictureMode) {
-            if (!viewModel.uiState.value.isFullscreenVideo) {
-                activeWebView?.enterPipVideoFocus()
-            }
-            // Keep WebView video & timers smoothly running inside the floating PiP window
+            // Keep video smoothly running inside the floating PiP window
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
         } else {
-            activeWebView?.exitPipVideoFocus()
+            val shouldExitTempFs = enteredFullscreenForPip
+            enteredFullscreenForPip = false
+            if (shouldExitTempFs) {
+                exitFullscreenAction?.invoke()
+            }
+            activeWebView?.restorePageAfterPip(exitTemporaryFullscreen = shouldExitTempFs)
         }
     }
 
     private fun applyWindowAndOrientation(
         isFullscreenVideo: Boolean,
         isInPipMode: Boolean,
+        isPreparingPip: Boolean,
     ) {
         if (isInPipMode) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -264,6 +288,13 @@ class MainActivity : ComponentActivity() {
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
         insetsController.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+
+        if (isPreparingPip) {
+            insetsController.hide(WindowInsetsCompat.Type.systemBars())
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            // Do not force orientation rotation while transitioning directly into PiP
+            return
+        }
 
         if (isFullscreenVideo) {
             insetsController.hide(WindowInsetsCompat.Type.systemBars())
@@ -291,7 +322,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         if (isInPictureInPictureMode) {
-            // Prevent Chromium WebView from pausing playback when the PiP window loses input focus
+            // Prevent Chromium WebView from pausing playback when the PiP window loses focus
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
         }
@@ -299,7 +330,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        // Pause WebView only when fully stopped (not during PiP where the activity remains visible)
+        // Pause WebView cleanly when app is minimized (not in PiP) or when PiP window is closed
         if (!isInPictureInPictureMode) {
             activeWebView?.onPause()
         }
@@ -307,24 +338,14 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        if (isReceiverRegistered) {
-            try {
-                unregisterReceiver(pipControlReceiver)
-            } catch (_: IllegalArgumentException) {
-                // Already unregistered.
-            }
-            isReceiverRegistered = false
-        }
+        cancelPendingPipFallback()
         networkMonitor.stop()
         activeWebView?.let { wv ->
             wv.stopLoading()
             wv.destroy()
         }
         activeWebView = null
+        exitFullscreenAction = null
         super.onDestroy()
-    }
-
-    companion object {
-        private const val PIP_PLAYBACK_REQUEST_CODE = 4001
     }
 }

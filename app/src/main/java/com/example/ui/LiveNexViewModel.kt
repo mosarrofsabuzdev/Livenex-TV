@@ -17,9 +17,18 @@ class LiveNexViewModel : ViewModel() {
         }
     }
 
+    fun setPreparingPip(preparing: Boolean) {
+        _uiState.update { current ->
+            current.copy(isPreparingPip = preparing)
+        }
+    }
+
     fun onPipModeChanged(isInPipMode: Boolean) {
         _uiState.update { current ->
-            current.copy(isInPipMode = isInPipMode)
+            current.copy(
+                isInPipMode = isInPipMode,
+                isPreparingPip = false,
+            )
         }
     }
 
@@ -122,7 +131,6 @@ class LiveNexViewModel : ViewModel() {
     }
 
     private fun isLikelyOfflineCode(errorCode: Int): Boolean {
-        // WebViewClient.ERROR_HOST_LOOKUP (-2), ERROR_CONNECT (-6), ERROR_TIMEOUT (-8)
         return errorCode == -2 || errorCode == -6 || errorCode == -8
     }
 }
