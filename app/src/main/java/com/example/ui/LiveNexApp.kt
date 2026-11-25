@@ -1,5 +1,6 @@
 package com.example.ui
 
+import android.graphics.Rect
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebChromeClient
@@ -11,16 +12,20 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.PictureInPictureAlt
@@ -47,9 +52,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -62,12 +72,14 @@ import com.example.web.LiveNexWebView
 import com.example.web.LiveNexWebViewClient
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 @Composable
 fun LiveNexApp(
     viewModel: LiveNexViewModel,
     onRegisterWebView: (LiveNexWebView?) -> Unit,
-    onEnterPipMode: () -> Unit,
+    onPipSourceRectChanged: (Rect) -> Unit,
+    onEnterPipMode: () -> Boolean,
     onExitApp: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -105,6 +117,13 @@ fun LiveNexApp(
                 message = message,
                 duration = SnackbarDuration.Short,
             )
+        }
+    }
+
+    fun triggerPipFromPlayer() {
+        val entered = onEnterPipMode()
+        if (!entered) {
+            showToastMessage(context.getString(R.string.pip_unavailable_message))
         }
     }
 
@@ -187,7 +206,22 @@ fun LiveNexApp(
                     } else {
                         Modifier
                     },
-                ),
+                )
+                .onGloballyPositioned { coords ->
+                    if (!uiState.isInPipMode) {
+                        val b = coords.boundsInWindow()
+                        if (b.width > 0f && b.height > 0f) {
+                            onPipSourceRectChanged(
+                                Rect(
+                                    b.left.roundToInt(),
+                                    b.top.roundToInt(),
+                                    b.right.roundToInt(),
+                                    b.bottom.roundToInt(),
+                                ),
+                            )
+                        }
+                    }
+                },
         ) {
             AndroidView(
                 modifier = Modifier
@@ -315,65 +349,51 @@ fun LiveNexApp(
         // Dedicated Edge-to-Edge Fullscreen HTML5 Video Container
         val activeFullscreenView = fullscreenView
         if (activeFullscreenView != null) {
-            Box(
+            AndroidView(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black),
-            ) {
-                AndroidView(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .testTag("fullscreen_video_container"),
-                    factory = { ctx ->
-                        FrameLayout(ctx).apply {
-                            setBackgroundColor(android.graphics.Color.BLACK)
-                            layoutParams = ViewGroup.LayoutParams(
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                            )
-                        }
-                    },
-                    update = { container ->
-                        if (activeFullscreenView.parent !== container) {
-                            (activeFullscreenView.parent as? ViewGroup)?.removeView(activeFullscreenView)
-                            container.removeAllViews()
-                            container.addView(
-                                activeFullscreenView,
-                                FrameLayout.LayoutParams(
-                                    ViewGroup.LayoutParams.MATCH_PARENT,
-                                    ViewGroup.LayoutParams.MATCH_PARENT,
-                                ),
-                            )
-                        }
-                    },
-                )
-
-                // Unobtrusive one-tap PiP button in fullscreen video (hidden automatically inside PiP window)
-                if (uiState.isPipSupported && !uiState.isInPipMode) {
-                    Surface(
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.background.copy(alpha = 0.55f),
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .displayCutoutPadding()
-                            .padding(14.dp),
-                    ) {
-                        IconButton(
-                            onClick = onEnterPipMode,
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("fullscreen_pip_button"),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.PictureInPictureAlt,
-                                contentDescription = stringResource(R.string.cd_enter_pip),
-                                tint = MaterialTheme.colorScheme.onBackground,
-                                modifier = Modifier.size(22.dp),
-                            )
-                        }
+                    .background(Color.Black)
+                    .testTag("fullscreen_video_container"),
+                factory = { ctx ->
+                    FrameLayout(ctx).apply {
+                        setBackgroundColor(android.graphics.Color.BLACK)
+                        layoutParams = ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                        )
                     }
-                }
-            }
+                },
+                update = { container ->
+                    if (activeFullscreenView.parent !== container) {
+                        (activeFullscreenView.parent as? ViewGroup)?.removeView(activeFullscreenView)
+                        container.removeAllViews()
+                        container.addView(
+                            activeFullscreenView,
+                            FrameLayout.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                            ),
+                        )
+                    }
+                },
+            )
+        }
+
+        // Compact, draggable floating PiP trigger accessible from ANYWHERE in the player
+        // (inline player, CSS fullscreen, iframe player, or HTML5 fullscreen). Hidden in PiP/splash/offline.
+        if (uiState.isPipSupported &&
+            uiState.isInitialLoadComplete &&
+            uiState.error == null &&
+            !uiState.isInPipMode
+        ) {
+            DraggablePipButton(
+                onClick = { triggerPipFromPlayer() },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .statusBarsPadding()
+                    .displayCutoutPadding()
+                    .navigationBarsPadding(),
+            )
         }
 
         // Cinema-styled Snackbar feedback (hidden while in PiP window)
@@ -391,6 +411,63 @@ fun LiveNexApp(
                     contentColor = MaterialTheme.colorScheme.onSurface,
                     actionColor = MaterialTheme.colorScheme.primary,
                     shape = MaterialTheme.shapes.medium,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Unobtrusive, draggable dark-glass Picture-in-Picture button that stays accessible from any
+ * screen or player state without acting like a browser bar, and can be dragged out of the way.
+ */
+@Composable
+private fun DraggablePipButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    BoxWithConstraints(modifier = modifier) {
+        val density = LocalDensity.current
+        val buttonSizePx = with(density) { 48.dp.toPx() }
+        val marginPx = with(density) { 14.dp.toPx() }
+        val maxX = (constraints.maxWidth.toFloat() - buttonSizePx - marginPx).coerceAtLeast(marginPx)
+        val maxY = (constraints.maxHeight.toFloat() - buttonSizePx - marginPx).coerceAtLeast(marginPx)
+
+        // Default neatly at top-end (or clamped cleanly on rotation)
+        var offsetX by remember { mutableFloatStateOf(Float.NaN) }
+        var offsetY by remember { mutableFloatStateOf(Float.NaN) }
+
+        val resolvedX = if (offsetX.isNaN()) maxX else offsetX.coerceIn(marginPx, maxX)
+        val resolvedY = if (offsetY.isNaN()) marginPx else offsetY.coerceIn(marginPx, maxY)
+
+        Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.background.copy(alpha = 0.65f),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)),
+            shadowElevation = 6.dp,
+            modifier = Modifier
+                .offset { IntOffset(resolvedX.roundToInt(), resolvedY.roundToInt()) }
+                .pointerInput(maxX, maxY) {
+                    detectDragGestures { change, dragAmount ->
+                        change.consume()
+                        val startX = if (offsetX.isNaN()) maxX else offsetX
+                        val startY = if (offsetY.isNaN()) marginPx else offsetY
+                        offsetX = (startX + dragAmount.x).coerceIn(marginPx, maxX)
+                        offsetY = (startY + dragAmount.y).coerceIn(marginPx, maxY)
+                    }
+                },
+        ) {
+            IconButton(
+                onClick = onClick,
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .testTag("floating_pip_button"),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.PictureInPictureAlt,
+                    contentDescription = stringResource(R.string.cd_enter_pip),
+                    tint = MaterialTheme.colorScheme.onBackground,
+                    modifier = Modifier.size(22.dp),
                 )
             }
         }

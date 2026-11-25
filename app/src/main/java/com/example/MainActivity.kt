@@ -1,10 +1,18 @@
 package com.example
 
+import android.app.PendingIntent
 import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Rect
+import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
 import android.util.Rational
@@ -17,6 +25,7 @@ import androidx.activity.viewModels
 import androidx.annotation.RequiresApi
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -36,10 +45,29 @@ class MainActivity : ComponentActivity() {
     private val viewModel: LiveNexViewModel by viewModels()
     private lateinit var networkMonitor: NetworkMonitor
     private var activeWebView: LiveNexWebView? = null
+    private var pipSourceRect: Rect? = null
+    private var isPipPlaying: Boolean = true
+    private var isReceiverRegistered: Boolean = false
+
+    private val pipMediaAction: String
+        get() = "$packageName.ACTION_PIP_TOGGLE_PLAYBACK"
 
     private val isPipSupported: Boolean
         get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+
+    private val pipControlReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != pipMediaAction) return
+            activeWebView?.togglePipPlayback { nowPlaying ->
+                isPipPlaying = nowPlaying
+                val state = viewModel.uiState.value
+                updatePipParams(
+                    autoEnterEnabled = state.isInitialLoadComplete && state.error == null,
+                )
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,6 +81,8 @@ class MainActivity : ComponentActivity() {
 
         networkMonitor = NetworkMonitor(applicationContext)
         networkMonitor.start()
+
+        registerPipControlReceiver()
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -88,6 +118,13 @@ class MainActivity : ComponentActivity() {
                     onRegisterWebView = { webView ->
                         activeWebView = webView
                     },
+                    onPipSourceRectChanged = { rect ->
+                        pipSourceRect = rect
+                        val state = viewModel.uiState.value
+                        updatePipParams(
+                            autoEnterEnabled = state.isInitialLoadComplete && state.error == null,
+                        )
+                    },
                     onEnterPipMode = { enterLiveNexPipMode() },
                     onExitApp = { finish() },
                 )
@@ -95,10 +132,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun registerPipControlReceiver() {
+        if (isReceiverRegistered || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val filter = IntentFilter(pipMediaAction)
+        ContextCompat.registerReceiver(
+            this,
+            pipControlReceiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        isReceiverRegistered = true
+    }
+
     @RequiresApi(Build.VERSION_CODES.O)
     private fun buildPipParams(autoEnterEnabled: Boolean): PictureInPictureParams {
         val builder = PictureInPictureParams.Builder()
             .setAspectRatio(Rational(16, 9))
+            .setActions(listOf(buildPlayPauseAction()))
+
+        pipSourceRect?.takeIf { !it.isEmpty }?.let { rect ->
+            builder.setSourceRectHint(rect)
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             builder
@@ -106,6 +160,31 @@ class MainActivity : ComponentActivity() {
                 .setSeamlessResizeEnabled(true)
         }
         return builder.build()
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun buildPlayPauseAction(): RemoteAction {
+        val intent = Intent(pipMediaAction).setPackage(packageName)
+        val pendingIntent = PendingIntent.getBroadcast(
+            this,
+            PIP_PLAYBACK_REQUEST_CODE,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val iconRes = if (isPipPlaying) {
+            android.R.drawable.ic_media_pause
+        } else {
+            android.R.drawable.ic_media_play
+        }
+        val title = getString(
+            if (isPipPlaying) R.string.pip_action_pause else R.string.pip_action_play,
+        )
+        return RemoteAction(
+            Icon.createWithResource(this, iconRes),
+            title,
+            title,
+            pendingIntent,
+        )
     }
 
     private fun updatePipParams(autoEnterEnabled: Boolean) {
@@ -117,22 +196,36 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun enterLiveNexPipMode() {
-        if (!isPipSupported || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        if (isInPictureInPictureMode) return
+    private fun enterLiveNexPipMode(): Boolean {
+        if (!isPipSupported || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+        if (isInPictureInPictureMode) return true
         val state = viewModel.uiState.value
         val allowAutoEnter = state.isInitialLoadComplete && state.error == null
-        try {
-            enterPictureInPictureMode(buildPipParams(autoEnterEnabled = allowAutoEnter))
+        isPipPlaying = true
+
+        // Focus inline/iframe player cleanly before morphing into PiP when not in HTML5 fullscreen
+        if (!state.isFullscreenVideo) {
+            activeWebView?.enterPipVideoFocus()
+        }
+
+        return try {
+            val entered = enterPictureInPictureMode(buildPipParams(autoEnterEnabled = allowAutoEnter))
+            if (!entered && !state.isFullscreenVideo) {
+                activeWebView?.exitPipVideoFocus()
+            }
+            entered
         } catch (_: IllegalStateException) {
-            // Ignore if PiP cannot be entered in the current lifecycle state.
+            if (!state.isFullscreenVideo) {
+                activeWebView?.exitPipVideoFocus()
+            }
+            false
         }
     }
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        // Android 12+ uses setAutoEnterEnabled(true); Android 8–11 enters PiP via onUserLeaveHint
-        if (Build.VERSION.SDK_INT in Build.VERSION_CODES.O until Build.VERSION_CODES.S) {
+        // Trigger PiP on Home/Recents across Android 8–16 (essential on MIUI/HyperOS & 3-button nav)
+        if (isPipSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val state = viewModel.uiState.value
             if (state.isInitialLoadComplete && state.error == null && !isInPictureInPictureMode) {
                 enterLiveNexPipMode()
@@ -146,9 +239,16 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         viewModel.onPipModeChanged(isInPictureInPictureMode)
+
         if (isInPictureInPictureMode) {
-            // Keep video smoothly running while floating in PiP
+            if (!viewModel.uiState.value.isFullscreenVideo) {
+                activeWebView?.enterPipVideoFocus()
+            }
+            // Keep WebView video & timers smoothly running inside the floating PiP window
             activeWebView?.onResume()
+            activeWebView?.resumeTimers()
+        } else {
+            activeWebView?.exitPipVideoFocus()
         }
     }
 
@@ -180,15 +280,26 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         networkMonitor.start()
         activeWebView?.onResume()
+        activeWebView?.resumeTimers()
     }
 
     override fun onResume() {
         super.onResume()
         activeWebView?.onResume()
+        activeWebView?.resumeTimers()
+    }
+
+    override fun onPause() {
+        if (isInPictureInPictureMode) {
+            // Prevent Chromium WebView from pausing playback when the PiP window loses input focus
+            activeWebView?.onResume()
+            activeWebView?.resumeTimers()
+        }
+        super.onPause()
     }
 
     override fun onStop() {
-        // Pause WebView only when fully stopped (not during PiP where the activity stays visible)
+        // Pause WebView only when fully stopped (not during PiP where the activity remains visible)
         if (!isInPictureInPictureMode) {
             activeWebView?.onPause()
         }
@@ -196,6 +307,14 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        if (isReceiverRegistered) {
+            try {
+                unregisterReceiver(pipControlReceiver)
+            } catch (_: IllegalArgumentException) {
+                // Already unregistered.
+            }
+            isReceiverRegistered = false
+        }
         networkMonitor.stop()
         activeWebView?.let { wv ->
             wv.stopLoading()
@@ -203,5 +322,9 @@ class MainActivity : ComponentActivity() {
         }
         activeWebView = null
         super.onDestroy()
+    }
+
+    companion object {
+        private const val PIP_PLAYBACK_REQUEST_CODE = 4001
     }
 }

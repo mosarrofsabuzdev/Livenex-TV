@@ -14,8 +14,8 @@ import kotlin.math.abs
 
 /**
  * Hardened hardware-accelerated [WebView] with smooth top-of-page pull-to-refresh gesture
- * detection that stays out of the way of normal scrolling, horizontal carousels, pinch-zoom,
- * and fullscreen video playback.
+ * detection and PiP video-focus helpers so inline, iframe, and fullscreen streams fill the
+ * Picture-in-Picture window cleanly.
  */
 class LiveNexWebView @JvmOverloads constructor(
     context: Context,
@@ -73,6 +73,31 @@ class LiveNexWebView @JvmOverloads constructor(
         cookieManager.setAcceptThirdPartyCookies(this, true)
     }
 
+    /**
+     * Expands the currently playing inline <video> or player <iframe> to fill 100% of the
+     * Picture-in-Picture window, bypassing ancestor CSS stacking contexts without reloading.
+     */
+    fun enterPipVideoFocus() {
+        evaluateJavascript(JS_ENTER_PIP_FOCUS, null)
+    }
+
+    /**
+     * Restores the original page layout cleanly when leaving Picture-in-Picture mode.
+     */
+    fun exitPipVideoFocus() {
+        evaluateJavascript(JS_EXIT_PIP_FOCUS, null)
+    }
+
+    /**
+     * Toggles play/pause on the active video element when the user taps the PiP control button.
+     */
+    fun togglePipPlayback(onIsPlayingResult: (Boolean) -> Unit) {
+        evaluateJavascript(JS_TOGGLE_PIP_PLAYBACK) { result ->
+            val playing = result?.contains("playing") == true
+            onIsPlayingResult(playing)
+        }
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (!pullToRefreshEnabled) {
@@ -125,7 +150,6 @@ class LiveNexWebView @JvmOverloads constructor(
                     if (dy <= 0f) {
                         resetPull()
                     } else {
-                        // Smooth damped resistance curve up to 1.35x threshold
                         val dampedOffset = dy * 0.48f
                         currentProgress = (dampedOffset / refreshThresholdPx).coerceIn(0f, 1.35f)
                         onPullProgress?.invoke(currentProgress)
@@ -162,5 +186,112 @@ class LiveNexWebView @JvmOverloads constructor(
         canStartPull = false
         currentProgress = 0f
         onPullProgress?.invoke(0f)
+    }
+
+    companion object {
+        private const val JS_ENTER_PIP_FOCUS = """
+            (function() {
+              try {
+                var existing = document.getElementById('__livenex_pip_style');
+                if (!existing) {
+                  var style = document.createElement('style');
+                  style.id = '__livenex_pip_style';
+                  style.textContent =
+                    'html.__livenex_pip_active, body.__livenex_pip_active { overflow: hidden !important; background: #000 !important; }' +
+                    '.__livenex_pip_ancestor { position: static !important; transform: none !important; filter: none !important; contain: none !important; overflow: visible !important; z-index: auto !important; max-width: none !important; max-height: none !important; }' +
+                    '.__livenex_pip_target { position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-width: none !important; max-height: none !important; min-width: 100vw !important; min-height: 100vh !important; z-index: 2147483647 !important; background: #000 !important; object-fit: contain !important; border: 0 !important; margin: 0 !important; padding: 0 !important; }';
+                  (document.head || document.documentElement).appendChild(style);
+                }
+
+                var videos = Array.prototype.slice.call(document.querySelectorAll('video'));
+                var target = null;
+                var bestArea = 0;
+                for (var i = 0; i < videos.length; i++) {
+                  var v = videos[i];
+                  var rect = v.getBoundingClientRect();
+                  var area = rect.width * rect.height;
+                  var isPlaying = !v.paused && !v.ended && v.readyState > 1;
+                  if (isPlaying && area > 0) {
+                    target = v;
+                    break;
+                  }
+                  if (area > bestArea) {
+                    bestArea = area;
+                    target = v;
+                  }
+                }
+
+                if (!target) {
+                  var iframes = Array.prototype.slice.call(document.querySelectorAll('iframe'));
+                  for (var j = 0; j < iframes.length; j++) {
+                    var f = iframes[j];
+                    var fRect = f.getBoundingClientRect();
+                    var fArea = fRect.width * fRect.height;
+                    if (fRect.width >= 180 && fRect.height >= 100 && fArea > bestArea) {
+                      bestArea = fArea;
+                      target = f;
+                    }
+                  }
+                }
+
+                if (target) {
+                  document.documentElement.classList.add('__livenex_pip_active');
+                  if (document.body) document.body.classList.add('__livenex_pip_active');
+                  target.classList.add('__livenex_pip_target');
+                  var parent = target.parentElement;
+                  while (parent && parent !== document.body && parent !== document.documentElement) {
+                    parent.classList.add('__livenex_pip_ancestor');
+                    parent = parent.parentElement;
+                  }
+                  if (target.tagName === 'VIDEO' && target.paused && target.readyState >= 2) {
+                    var playPromise = target.play();
+                    if (playPromise && playPromise.catch) { playPromise.catch(function(){}); }
+                  }
+                }
+              } catch (e) {}
+            })();
+        """
+
+        private const val JS_EXIT_PIP_FOCUS = """
+            (function() {
+              try {
+                var style = document.getElementById('__livenex_pip_style');
+                if (style && style.parentNode) style.parentNode.removeChild(style);
+                document.documentElement.classList.remove('__livenex_pip_active');
+                if (document.body) document.body.classList.remove('__livenex_pip_active');
+                var targets = document.querySelectorAll('.__livenex_pip_target');
+                for (var i = 0; i < targets.length; i++) {
+                  targets[i].classList.remove('__livenex_pip_target');
+                }
+                var ancestors = document.querySelectorAll('.__livenex_pip_ancestor');
+                for (var j = 0; j < ancestors.length; j++) {
+                  ancestors[j].classList.remove('__livenex_pip_ancestor');
+                }
+              } catch (e) {}
+            })();
+        """
+
+        private const val JS_TOGGLE_PIP_PLAYBACK = """
+            (function() {
+              try {
+                var videos = Array.prototype.slice.call(document.querySelectorAll('video'));
+                var v = document.querySelector('.__livenex_pip_target');
+                if (!v || v.tagName !== 'VIDEO') {
+                  v = videos.find(function(item) { return !item.paused; }) || videos[0];
+                }
+                if (!v) return 'playing';
+                if (v.paused) {
+                  var p = v.play();
+                  if (p && p.catch) { p.catch(function(){}); }
+                  return 'playing';
+                } else {
+                  v.pause();
+                  return 'paused';
+                }
+              } catch (e) {
+                return 'playing';
+              }
+            })();
+        """
     }
 }
